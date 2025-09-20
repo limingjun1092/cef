@@ -1,77 +1,125 @@
-name: Build CEF
+name: Advanced CEF Custom Build
 
 on:
-  workflow_dispatch:  # 允许手动触发
-  push:
-    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      enable_mp3:
+        description: 'Enable MP3 audio support'
+        required: false
+        default: 'true'
+      enable_h264:
+        description: 'Enable H264 video support'
+        required: false
+        default: 'true'
+      enable_widevine:
+        description: 'Enable Widevine CDM support'
+        required: false
+        default: 'false'
 
 env:
-  CEF_BRANCH: 140
-  CEF_USE_GN: 1
-  CEF_USE_SANDBOX: 1
+  CEF_VERSION: "140.1.14+geb1c06e+chromium-140.0.7339.185"
+  CEF_ARCH: "windows64"
 
 jobs:
-  build-windows64:
+  custom-cef-build:
     runs-on: windows-latest
-    timeout-minutes: 360  # 6小时超时
-    env:
-      CEF_ARCH: x64
+    timeout-minutes: 180
     
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
+    - name: Setup build environment
+      uses: microsoft/setup-msbuild@v2
       with:
-        python-version: '3.11'
-
-    - name: Download automate.py
+        vs-version: '17.0'
+        
+    - name: Install 7-Zip
       run: |
-        # 直接从 GitHub 下载（更可靠）
-        curl -LO "https://raw.githubusercontent.com/chromiumembedded/cef/master/tools/automate/automate.py"
-        # 如果失败，尝试 Bitbucket 作为备用
-        if (!(Test-Path "automate.py") -or (Get-Item "automate.py").Length -eq 0) {
-          curl -LO "https://bitbucket.org/chromiumembedded/cef/raw/master/tools/automate/automate.py"
+        choco install 7zip -y
+
+    - name: Download and extract CEF binary
+      run: |
+        $url = "https://cef-builds.spotifycdn.com/cef_binary_$env:CEF_VERSION_$env:CEF_ARCH.tar.bz2"
+        Write-Host "Downloading CEF from: $url"
+        Invoke-WebRequest -Uri $url -OutFile "cef_binary.tar.bz2"
+        
+        7z x cef_binary.tar.bz2 -ocef_temp
+        7z x "cef_temp/cef_binary_$env:CEF_VERSION_$env:CEF_ARCH.tar" -ocef_binary
+
+    - name: Apply custom patches (可选)
+      run: |
+        # 如果有自定义补丁，可以在这里应用
+        # git apply my_custom_patch.patch
+        Write-Host "可在此处添加自定义补丁"
+
+    - name: Configure custom build
+      run: |
+        $cmakeOptions = @(
+          "-G", "Visual Studio 17 2022",
+          "-A", "x64",
+          "-DCMAKE_BUILD_TYPE=Release",
+          "-DUSE_SANDBOX=ON",
+          "-DCEF_RUNTIME_LIBRARY_FLAG=/MT"
+        )
+        
+        # 根据输入参数添加选项
+        if ("${{ github.event.inputs.enable_mp3 }}" -eq "true") {
+          $cmakeOptions += "-DCEF_ENABLE_MP3_AUDIO=ON"
         }
+        
+        if ("${{ github.event.inputs.enable_h264 }}" -eq "true") {
+          $cmakeOptions += "-DCEF_ENABLE_H264=ON"
+        }
+        
+        if ("${{ github.event.inputs.enable_widevine }}" -eq "true") {
+          $cmakeOptions += "-DCEF_ENABLE_WIDEVINE=ON"
+        }
+        
+        mkdir build
+        cd build
+        cmake ../cef_binary @cmakeOptions
 
-    - name: Run automate.py (最小化构建)
+    - name: Build the project
       run: |
-        python automate.py --branch=$env:CEF_BRANCH --arch=$env:CEF_ARCH --force-build --minimal-distrib --no-debug-build
+        cd build
+        msbuild cef.sln /p:Configuration=Release /p:Platform=x64 /m /v:minimal
+
+    - name: Run tests (可选)
+      run: |
+        cd build
+        # 运行测试（如果有）
+        # ctest -C Release --verbose
+
+    - name: Create distribution package
+      run: |
+        # 创建包含所有必要文件的发行包
+        $distDir = "cef_custom_$env:CEF_VERSION"
+        mkdir $distDir
+        
+        # 复制原始文件
+        cp -r cef_binary/* $distDir/
+        
+        # 复制新编译的文件
+        cp -r build/Release/* $distDir/
+        cp -r build/Release/*.lib $distDir/lib/
+        
+        # 创建文档和说明
+        echo "Custom CEF Build $env:CEF_VERSION" > $distDir/README.txt
+        echo "Built on GitHub Actions: $(Get-Date)" >> $distDir/README.txt
+        echo "Custom options: MP3=${{ github.event.inputs.enable_mp3 }}, H264=${{ github.event.inputs.enable_h264 }}, Widevine=${{ github.event.inputs.enable_widevine }}" >> $distDir/README.txt
+        
+        # 打包
+        7z a -ttar "${distDir}.tar" $distDir
+        7z a -tbzip2 "${distDir}.tar.bz2" "${distDir}.tar"
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: cef_binary_windows64
-        path: code/chromium/src/cef/binary_distrib/*.tar.bz2
-
-  build-linux64:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6小时超时
-    env:
-      CEF_ARCH: x64
-      CEF_USE_SANDBOX: 0  # Linux 上通常禁用沙盒
-      
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-
-    - name: Install basic dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y curl python3 python3-pip
-
-    - name: Download automate.py
-      run: |
-        curl -LO "https://raw.githubusercontent.com/chromiumembedded/cef/master/tools/automate/automate.py" || \
-        curl -LO "https://bitbucket.org/chromiumembedded/cef/raw/master/tools/automate/automate.py"
-
-    - name: Run automate.py (最小化构建)
-      run: |
-        python automate.py --branch=$CEF_BRANCH --arch=$CEF_ARCH --force-build --minimal-distrib --no-debug-build
-
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: cef_binary_linux64
-        path: code/chromium/src/cef/binary_distrib/*.tar.bz2
+        name: custom_cef_package
+        path: |
+          *.tar.bz2
+          build/Release/*.exe
+          build/Release/*.dll
+          build/Release/*.lib
+        retention-days: 7
