@@ -1,47 +1,104 @@
 name: Build CEF
 
 on:
-  workflow_dispatch: # 允许手动触发
+  workflow_dispatch:
   schedule:
-    - cron: '0 0 * * 0'  # 每周日凌晨运行一次（可选）
+    - cron: '0 0 * * 0'
 
 env:
-  CEF_BRANCH: 140  # 使用分支号140对应版本140.1.14
+  CEF_BRANCH: 140
   CEF_USE_GN: 1
   CEF_USE_SANDBOX: 1
 
 jobs:
   build-windows64:
     runs-on: windows-latest
+    timeout-minutes: 480
     env:
       CEF_ARCH: x64
+      GYP_MSVS_VERSION: 2022
+      DEPOT_TOOLS_WIN_TOOLCHAIN: 0
+    
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+
+    - name: Setup build tools
+      uses: microsoft/setup-msbuild@v2
+      with:
+        vs-version: '17.0'
 
     - name: Setup Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
+    - name: Check disk space
+      run: |
+        wmic logicaldisk get size,freespace,caption
+
     - name: Download automate.py
       run: |
-        Invoke-WebRequest -Uri "https://bitbucket.org/chromiumembedded/cef/raw/master/tools/automate/automate.py" -OutFile "automate.py"
+        # 尝试多个可能的 URL
+        $urls = @(
+          "https://bitbucket.org/chromiumembedded/cef/raw/master/tools/automate/automate.py",
+          "https://raw.githubusercontent.com/chromiumembedded/cef/master/tools/automate/automate.py"
+        )
+        
+        foreach ($url in $urls) {
+          try {
+            Write-Host "Trying URL: $url"
+            Invoke-WebRequest -Uri $url -OutFile "automate.py"
+            if (Test-Path "automate.py" -And (Get-Item "automate.py").Length -gt 0) {
+              Write-Host "Successfully downloaded automate.py from $url"
+              break
+            }
+          } catch {
+            Write-Host "Failed to download from $url: $($_.Exception.Message)"
+          }
+        }
+        
+        if (-not (Test-Path "automate.py" -And (Get-Item "automate.py").Length -gt 0)) {
+          Write-Error "Failed to download automate.py from any source"
+          exit 1
+        }
 
     - name: Run automate.py on Windows
       run: |
-        python automate.py --branch=$env:CEF_BRANCH --arch=$env:CEF_ARCH --use-gn=$env:CEF_USE_GN --use-sandbox=$env:CEF_USE_SANDBOX --force-build --minimal-distrib --client-distrib --no-debug-build
+        # 设置重试机制
+        $maxRetries = 3
+        $retryCount = 0
+        $completed = $false
+        
+        while (-not $completed -and $retryCount -lt $maxRetries) {
+          try {
+            Write-Host "Attempt $($retryCount + 1) of $maxRetries"
+            python automate.py --branch=$env:CEF_BRANCH --arch=$env:CEF_ARCH --use-gn=$env:CEF_USE_GN --use-sandbox=$env:CEF_USE_SANDBOX --force-build --minimal-distrib --client-distrib --no-debug-build -v
+            $completed = $true
+          } catch {
+            $retryCount++
+            if ($retryCount -eq $maxRetries) {
+              throw
+            }
+            Start-Sleep -Seconds 60
+          }
+        }
+      shell: pwsh
 
     - name: Upload Windows artifacts
+      if: success()
       uses: actions/upload-artifact@v4
       with:
         name: cef_binary_140_windows64
         path: code/chromium/src/cef/binary_distrib/*.tar.bz2
+        retention-days: 7
 
   build-linux64:
     runs-on: ubuntu-latest
+    timeout-minutes: 480
     env:
       CEF_ARCH: x64
+      
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -53,16 +110,57 @@ jobs:
           libgtk-3-dev libnss3-dev libxss-dev libasound2-dev libxtst-dev \
           libgbm-dev libgles2-mesa-dev libglu1-mesa-dev
 
+    - name: Check disk space
+      run: |
+        df -h
+
     - name: Download automate.py
       run: |
-        wget https://bitbucket.org/chromiumembedded/cef/raw/master/tools/automate/automate.py
+        # 尝试多个可能的 URL
+        urls=(
+          "https://bitbucket.org/chromiumembedded/cef/raw/master/tools/automate/automate.py"
+          "https://raw.githubusercontent.com/chromiumembedded/cef/master/tools/automate/automate.py"
+        )
+        
+        for url in "${urls[@]}"; do
+          echo "Trying URL: $url"
+          if curl -L -o automate.py "$url" && [ -s automate.py ]; then
+            echo "Successfully downloaded automate.py from $url"
+            break
+          else
+            echo "Failed to download from $url"
+            rm -f automate.py
+          fi
+        done
+        
+        if [ ! -s automate.py ]; then
+          echo "Failed to download automate.py from any source"
+          exit 1
+        fi
 
     - name: Run automate.py on Linux
       run: |
-        python automate.py --branch=$CEF_BRANCH --arch=$CEF_ARCH --use-gn=$CEF_USE_GN --use-sandbox=$CEF_USE_SANDBOX --force-build --minimal-distrib --client-distrib --no-debug-build
+        # 设置重试机制
+        max_retries=3
+        retry_count=0
+        
+        until [ $retry_count -ge $max_retries ]
+        do
+          python automate.py --branch=$CEF_BRANCH --arch=$CEF_ARCH --use-gn=$CEF_USE_GN --use-sandbox=$CEF_USE_SANDBOX --force-build --minimal-distrib --client-distrib --no-debug-build -v && break
+          retry_count=$((retry_count+1))
+          echo "Attempt $retry_count failed. Retrying in 60 seconds..."
+          sleep 60
+        done
+        
+        if [ $retry_count -eq $max_retries ]; then
+          echo "All attempts failed"
+          exit 1
+        fi
 
     - name: Upload Linux artifacts
+      if: success()
       uses: actions/upload-artifact@v4
       with:
         name: cef_binary_140_linux64
         path: code/chromium/src/cef/binary_distrib/*.tar.bz2
+        retention-days: 7
